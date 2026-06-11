@@ -1,6 +1,7 @@
 # rupca (rust PCA)
 
 `rupca` is a small Rust crate that mirrors the sparse centered PCA path used by Scanpy for sparse input with `zero_center=True`.
+It is compatible with both ordinary sparse inputs, such as logPF-normalized matrices, and PFlogPF / shifted-CLR inputs represented without densifying the matrix.
 
 The implemented path is:
 
@@ -14,11 +15,15 @@ The implemented path is:
 6. Run dense SVD on `Av`.
 7. Recover scores, components, singular values, explained variance, and noise variance in the same style as sklearn PCA.
 
-The current public entrypoint is:
+The current public entrypoints are:
 
 - `pca_scanpy_sparse_csr(&CsrMatrix, ScanpyPcaParams) -> Result<ScanpyPcaResult>`
+- `pca_shifted_clr_sparse_csr(&ShiftedClrCsrMatrix, ScanpyPcaParams) -> Result<ScanpyPcaResult>`
 
-The matrix format is a simple CSR container owned by `rupca`.
+The plain sparse matrix format is a simple CSR container owned by `rupca`.
+`ShiftedClrCsrMatrix` represents the dense matrix `sparse[i, j] - row_center[i]`.
+This keeps PFlogPF / shifted-CLR data as a sparse shifted-log matrix plus a row
+centering vector while preserving implicit column centering inside PCA.
 
 ## Status
 
@@ -26,6 +31,8 @@ The crate currently:
 
 - compiles cleanly
 - passes unit tests on both tall and wide sparse matrices against the corresponding centered dense SVD reference
+- passes unit tests on both tall and wide shifted-CLR-style matrices against a centered dense SVD reference
+- passes representation-level tests showing sparse PFlogPF / shifted-CLR operations match dense materialization to floating-point precision
 - vendors the exact ARPACK symmetric reference sources used for the Scanpy/sklearn sparse path in [vendor/arpack-ng/SRC](/Users/lpachter/Dropbox/claude/projects/rupca/vendor/arpack-ng/SRC)
 
 ## Notes

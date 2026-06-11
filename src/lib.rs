@@ -94,6 +94,167 @@ impl CsrMatrix {
     }
 }
 
+trait PcaInputMatrix {
+    fn validate(&self) -> Result<()>;
+    fn n_rows(&self) -> usize;
+    fn n_cols(&self) -> usize;
+    fn mean_variance_axis0(&self) -> (Vec<f64>, Vec<f64>);
+    fn matvec(&self, x: &[f64], y: &mut [f64]);
+    fn rmatvec(&self, x: &[f64], y: &mut [f64]);
+
+    fn centered_normal_right<'a>(
+        &'a self,
+        mean: &'a [f64],
+    ) -> Box<dyn FnMut(&[f64], &mut [f64]) + 'a>
+    where
+        Self: Sized,
+    {
+        let centered = ImplicitColumnOffset { x: self, mean };
+        let mut tmp = vec![0.0; self.n_rows()];
+        Box::new(move |vin, vout| {
+            centered.matvec(vin, &mut tmp);
+            centered.rmatvec(&tmp, vout);
+        })
+    }
+
+    fn centered_normal_left<'a>(
+        &'a self,
+        mean: &'a [f64],
+    ) -> Box<dyn FnMut(&[f64], &mut [f64]) + 'a>
+    where
+        Self: Sized,
+    {
+        let centered = ImplicitColumnOffset { x: self, mean };
+        let mut tmp = vec![0.0; self.n_cols()];
+        Box::new(move |vin, vout| {
+            centered.rmatvec(vin, &mut tmp);
+            centered.matvec(&tmp, vout);
+        })
+    }
+}
+
+impl PcaInputMatrix for CsrMatrix {
+    fn validate(&self) -> Result<()> {
+        CsrMatrix::validate(self)
+    }
+
+    fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    fn n_cols(&self) -> usize {
+        self.n_cols
+    }
+
+    fn mean_variance_axis0(&self) -> (Vec<f64>, Vec<f64>) {
+        mean_variance_axis0(self)
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        CsrMatrix::matvec(self, x, y)
+    }
+
+    fn rmatvec(&self, x: &[f64], y: &mut [f64]) {
+        CsrMatrix::rmatvec(self, x, y)
+    }
+
+    fn centered_normal_right<'a>(
+        &'a self,
+        mean: &'a [f64],
+    ) -> Box<dyn FnMut(&[f64], &mut [f64]) + 'a> {
+        let mut tmp = vec![0.0; self.n_rows];
+        let n_rows_f = self.n_rows as f64;
+        Box::new(move |vin, vout| {
+            self.matvec(vin, &mut tmp);
+            self.rmatvec(&tmp, vout);
+            let alpha = n_rows_f * dot(mean, vin);
+            for (y, m) in vout.iter_mut().zip(mean.iter()) {
+                *y -= alpha * m;
+            }
+        })
+    }
+}
+
+/// Dense shifted-CLR-style data represented as a sparse matrix plus a row centering vector.
+///
+/// The represented dense value is `sparse[i, j] - row_center[i]`. For a common
+/// shifted CLR workflow, `sparse` would contain the nonzero shifted-log values
+/// and `row_center[i]` would be the row mean subtracted from every feature.
+#[derive(Debug, Clone)]
+pub struct ShiftedClrCsrMatrix {
+    pub sparse: CsrMatrix,
+    pub row_center: Vec<f64>,
+}
+
+impl ShiftedClrCsrMatrix {
+    pub fn validate(&self) -> Result<()> {
+        self.sparse.validate()?;
+        if self.row_center.len() != self.sparse.n_rows {
+            return Err(RuPcaError::InvalidInput(
+                "row_center length must equal sparse.n_rows".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PcaInputMatrix for ShiftedClrCsrMatrix {
+    fn validate(&self) -> Result<()> {
+        ShiftedClrCsrMatrix::validate(self)
+    }
+
+    fn n_rows(&self) -> usize {
+        self.sparse.n_rows
+    }
+
+    fn n_cols(&self) -> usize {
+        self.sparse.n_cols
+    }
+
+    fn mean_variance_axis0(&self) -> (Vec<f64>, Vec<f64>) {
+        let mut sums = vec![0.0; self.sparse.n_cols];
+        let row_center_sum = self.row_center.iter().sum::<f64>();
+        let row_center_sq_sum = self.row_center.iter().map(|v| v * v).sum::<f64>();
+        let mut sq_sums = vec![row_center_sq_sum; self.sparse.n_cols];
+        for i in 0..self.sparse.n_rows {
+            let row_center = self.row_center[i];
+            for p in self.sparse.indptr[i]..self.sparse.indptr[i + 1] {
+                let j = self.sparse.indices[p];
+                let v = self.sparse.data[p];
+                sums[j] += v;
+                sq_sums[j] += v * v - 2.0 * v * row_center;
+            }
+        }
+        let n = self.sparse.n_rows as f64;
+        let mean = sums
+            .iter()
+            .map(|s| (*s - row_center_sum) / n)
+            .collect::<Vec<_>>();
+        let var = sq_sums
+            .iter()
+            .zip(mean.iter())
+            .map(|(ss, m)| (ss / n) - m * m)
+            .collect::<Vec<_>>();
+        (mean, var)
+    }
+
+    fn matvec(&self, x: &[f64], y: &mut [f64]) {
+        self.sparse.matvec(x, y);
+        let s = x.iter().sum::<f64>();
+        for (out, center) in y.iter_mut().zip(self.row_center.iter()) {
+            *out -= center * s;
+        }
+    }
+
+    fn rmatvec(&self, x: &[f64], y: &mut [f64]) {
+        self.sparse.rmatvec(x, y);
+        let off = dot(&self.row_center, x);
+        for out in y.iter_mut() {
+            *out -= off;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScanpyPcaParams {
     pub n_components: usize,
@@ -130,9 +291,23 @@ pub struct ScanpyPcaResult {
 }
 
 pub fn pca_scanpy_sparse_csr(x: &CsrMatrix, params: ScanpyPcaParams) -> Result<ScanpyPcaResult> {
+    pca_column_centered(x, params)
+}
+
+pub fn pca_shifted_clr_sparse_csr(
+    x: &ShiftedClrCsrMatrix,
+    params: ScanpyPcaParams,
+) -> Result<ScanpyPcaResult> {
+    pca_column_centered(x, params)
+}
+
+fn pca_column_centered<M: PcaInputMatrix>(
+    x: &M,
+    params: ScanpyPcaParams,
+) -> Result<ScanpyPcaResult> {
     x.validate()?;
-    let n_samples = x.n_rows;
-    let n_features = x.n_cols;
+    let n_samples = x.n_rows();
+    let n_features = x.n_cols();
     if n_samples == 0 || n_features == 0 {
         return Err(RuPcaError::InvalidInput("empty matrix".to_string()));
     }
@@ -145,30 +320,28 @@ pub fn pca_scanpy_sparse_csr(x: &CsrMatrix, params: ScanpyPcaParams) -> Result<S
         )));
     }
 
-    let (mean, var) = mean_variance_axis0(x);
+    let (mean, var) = x.mean_variance_axis0();
     let total_var = if n_samples > 1 {
         var.iter().sum::<f64>() * n_samples as f64 / (n_samples as f64 - 1.0)
     } else {
         0.0
     };
 
-    let centered = ImplicitColumnOffset { x, mean: &mean };
-
     let transpose = n_samples < n_features;
     let normal_dim = min_dim;
     let profile = std::env::var_os("RUPCA_PROFILE").is_some();
-    let ncv = params
-        .ncv
-        .unwrap_or_else(|| choose_ncv(k))
-        .min(normal_dim);
+    let ncv = params.ncv.unwrap_or_else(|| choose_ncv(k)).min(normal_dim);
     let maxiter = params.maxiter.unwrap_or(normal_dim * 10);
     let v0 = init_arpack_v0(normal_dim, params.seed);
 
     let eigsh_start = Instant::now();
     let mut op_calls = 0usize;
-    let eigvec = if !transpose {
-        let mut tmp = vec![0.0; x.n_rows];
-        let n_rows_f = x.n_rows as f64;
+    let eigvec = {
+        let mut op = if !transpose {
+            x.centered_normal_right(&mean)
+        } else {
+            x.centered_normal_left(&mean)
+        };
         eigsh(
             normal_dim,
             k,
@@ -178,37 +351,20 @@ pub fn pca_scanpy_sparse_csr(x: &CsrMatrix, params: ScanpyPcaParams) -> Result<S
             &v0,
             |vin, vout| {
                 op_calls += 1;
-                x.matvec(vin, &mut tmp);
-                x.rmatvec(&tmp, vout);
-                let alpha = n_rows_f * dot(&mean, vin);
-                for (y, m) in vout.iter_mut().zip(mean.iter()) {
-                    *y -= alpha * m;
-                }
-            },
-        )?
-    } else {
-        let mut tmp = vec![0.0; x.n_cols];
-        eigsh(
-            normal_dim,
-            k,
-            ncv,
-            maxiter,
-            params.tol * params.tol,
-            &v0,
-            |vin, vout| {
-                op_calls += 1;
-                centered.rmatvec(vin, &mut tmp);
-                centered.matvec(&tmp, vout);
+                op(vin, vout);
             },
         )?
     };
     let eigsh_secs = eigsh_start.elapsed().as_secs_f64();
 
     let av_start = Instant::now();
-    let av = if !transpose {
-        centered.matmat(&eigvec)
-    } else {
-        centered.rmatmat(&eigvec)
+    let av = {
+        let centered = ImplicitColumnOffset { x, mean: &mean };
+        if !transpose {
+            centered.matmat(&eigvec)
+        } else {
+            centered.rmatmat(&eigvec)
+        }
     };
     let av_secs = av_start.elapsed().as_secs_f64();
 
@@ -306,12 +462,12 @@ fn mean_variance_axis0(x: &CsrMatrix) -> (Vec<f64>, Vec<f64>) {
     (mean, var)
 }
 
-struct ImplicitColumnOffset<'a> {
-    x: &'a CsrMatrix,
+struct ImplicitColumnOffset<'a, M: PcaInputMatrix> {
+    x: &'a M,
     mean: &'a [f64],
 }
 
-impl ImplicitColumnOffset<'_> {
+impl<M: PcaInputMatrix> ImplicitColumnOffset<'_, M> {
     fn matvec(&self, v: &[f64], out: &mut [f64]) {
         self.x.matvec(v, out);
         let off = dot(self.mean, v);
@@ -329,11 +485,11 @@ impl ImplicitColumnOffset<'_> {
     }
 
     fn matmat(&self, m: &DMatrix<f64>) -> DMatrix<f64> {
-        let mut out = DMatrix::zeros(self.x.n_rows, m.ncols());
-        let mut tmp = vec![0.0; self.x.n_rows];
+        let mut out = DMatrix::zeros(self.x.n_rows(), m.ncols());
+        let mut tmp = vec![0.0; self.x.n_rows()];
         for col in 0..m.ncols() {
             self.matvec(m.column(col).as_slice(), &mut tmp);
-            for row in 0..self.x.n_rows {
+            for row in 0..self.x.n_rows() {
                 out[(row, col)] = tmp[row];
             }
         }
@@ -341,27 +497,15 @@ impl ImplicitColumnOffset<'_> {
     }
 
     fn rmatmat(&self, m: &DMatrix<f64>) -> DMatrix<f64> {
-        let mut out = DMatrix::zeros(self.x.n_cols, m.ncols());
-        let mut tmp = vec![0.0; self.x.n_cols];
+        let mut out = DMatrix::zeros(self.x.n_cols(), m.ncols());
+        let mut tmp = vec![0.0; self.x.n_cols()];
         for col in 0..m.ncols() {
             self.rmatvec(m.column(col).as_slice(), &mut tmp);
-            for row in 0..self.x.n_cols {
+            for row in 0..self.x.n_cols() {
                 out[(row, col)] = tmp[row];
             }
         }
         out
-    }
-
-    fn normal_right_matvec(&self, v: &[f64], out: &mut [f64]) {
-        let mut tmp = vec![0.0; self.x.n_rows];
-        self.matvec(v, &mut tmp);
-        self.rmatvec(&tmp, out);
-    }
-
-    fn normal_left_matvec(&self, v: &[f64], out: &mut [f64]) {
-        let mut tmp = vec![0.0; self.x.n_cols];
-        self.rmatvec(v, &mut tmp);
-        self.matvec(&tmp, out);
     }
 }
 
@@ -425,7 +569,18 @@ where
     let mut rnorm = norm(&resid);
     let mut v = DMatrix::zeros(n, ncv);
     let mut h = DMatrix::zeros(ncv, 2);
-    let result = dsaup2_mode1("LM", k, ncv - k, tol.max(1e-10), maxiter, &mut resid, &mut rnorm, &mut v, &mut h, op)?;
+    let result = dsaup2_mode1(
+        "LM",
+        k,
+        ncv - k,
+        tol.max(1e-10),
+        maxiter,
+        &mut resid,
+        &mut rnorm,
+        &mut v,
+        &mut h,
+        op,
+    )?;
     if std::env::var_os("RUPCA_PROFILE").is_some() {
         eprintln!(
             "rupca_eigsh info={} basis_dim={} nconv={} nev={} np={} rnorm={:.6} first_ritz={:?} first_bounds={:?}",
@@ -553,7 +708,9 @@ fn extract_selected_ritz_vectors(
             }
         }
         let idx = best_idx.ok_or_else(|| {
-            RuPcaError::Solver("failed to match selected Ritz values to tridiagonal eigenpairs".to_string())
+            RuPcaError::Solver(
+                "failed to match selected Ritz values to tridiagonal eigenpairs".to_string(),
+            )
         })?;
         used[idx] = true;
         for row in 0..m {
@@ -567,13 +724,13 @@ fn extract_selected_ritz_vectors(
 
 #[cfg(test)]
 mod tests {
-    use crate::arpack_symm::apps::dsapps;
+    use super::*;
     use crate::arpack_symm::aitr::dsaitr_mode1;
+    use crate::arpack_symm::apps::dsapps;
     use crate::arpack_symm::aup2::dsaup2_mode1;
     use crate::arpack_symm::conv::dsconv;
     use crate::arpack_symm::sort::{dsesrt, dsgets, dsortr};
     use crate::arpack_symm::tridiag::dseigt;
-    use super::*;
     use serde_json::Value;
     use std::fs;
     use std::path::PathBuf;
@@ -635,7 +792,10 @@ mod tests {
         dense
     }
 
-    fn dense_reference(x: &CsrMatrix, n_components: usize) -> (Vec<f64>, DMatrix<f64>, DMatrix<f64>) {
+    fn dense_reference(
+        x: &CsrMatrix,
+        n_components: usize,
+    ) -> (Vec<f64>, DMatrix<f64>, DMatrix<f64>) {
         let centered = centered_dense(x);
         let svd = centered.svd(true, true);
         let u = svd.u.unwrap();
@@ -650,6 +810,72 @@ mod tests {
         (s, scores, vt.rows(0, n_components).into_owned())
     }
 
+    fn shifted_clr_from_sparse(sparse: CsrMatrix) -> ShiftedClrCsrMatrix {
+        let mut row_center = vec![0.0; sparse.n_rows];
+        for i in 0..sparse.n_rows {
+            let mut row_sum = 0.0;
+            for p in sparse.indptr[i]..sparse.indptr[i + 1] {
+                row_sum += sparse.data[p];
+            }
+            row_center[i] = row_sum / sparse.n_cols as f64;
+        }
+        ShiftedClrCsrMatrix { sparse, row_center }
+    }
+
+    fn shifted_clr_dense(x: &ShiftedClrCsrMatrix) -> DMatrix<f64> {
+        let mut dense = DMatrix::zeros(x.sparse.n_rows, x.sparse.n_cols);
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense[(i, j)] = -x.row_center[i];
+            }
+            for p in x.sparse.indptr[i]..x.sparse.indptr[i + 1] {
+                dense[(i, x.sparse.indices[p])] += x.sparse.data[p];
+            }
+        }
+        dense
+    }
+
+    fn shifted_clr_centered_dense(x: &ShiftedClrCsrMatrix) -> DMatrix<f64> {
+        let mut dense = shifted_clr_dense(x);
+        for j in 0..x.sparse.n_cols {
+            let mean = dense.column(j).iter().sum::<f64>() / x.sparse.n_rows as f64;
+            for i in 0..x.sparse.n_rows {
+                dense[(i, j)] -= mean;
+            }
+        }
+        dense
+    }
+
+    fn shifted_clr_dense_reference(
+        x: &ShiftedClrCsrMatrix,
+        n_components: usize,
+    ) -> (Vec<f64>, DMatrix<f64>, DMatrix<f64>) {
+        let centered = shifted_clr_centered_dense(x);
+        let svd = centered.svd(true, true);
+        let u = svd.u.unwrap();
+        let vt = svd.v_t.unwrap();
+        let s = svd.singular_values.as_slice()[..n_components].to_vec();
+        let mut scores = DMatrix::zeros(x.sparse.n_rows, n_components);
+        for i in 0..x.sparse.n_rows {
+            for j in 0..n_components {
+                scores[(i, j)] = u[(i, j)] * s[j];
+            }
+        }
+        (s, scores, vt.rows(0, n_components).into_owned())
+    }
+
+    fn assert_all_close(a: &[f64], b: &[f64], tol: f64) {
+        let max_abs = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0, f64::max);
+        assert!(
+            max_abs <= tol,
+            "max abs difference {max_abs} exceeded tolerance {tol}"
+        );
+    }
+
     fn abs_dot(a: &[f64], b: &[f64]) -> f64 {
         dot(a, b).abs()
     }
@@ -657,7 +883,9 @@ mod tests {
     fn scanpy_python() -> PathBuf {
         std::env::var_os("SCANPY_PYTHON")
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/Users/lpachter/Dropbox/claude/projects/scanpy-env/bin/python"))
+            .unwrap_or_else(|| {
+                PathBuf::from("/Users/lpachter/Dropbox/claude/projects/scanpy-env/bin/python")
+            })
     }
 
     fn compare_with_scanpy(x: &CsrMatrix, k: usize, seed: u64) {
@@ -772,13 +1000,25 @@ print(json.dumps(out))
             .as_array()
             .unwrap()
             .iter()
-            .flat_map(|row| row.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>())
+            .flat_map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let py_components = py["components"]
             .as_array()
             .unwrap()
             .iter()
-            .flat_map(|row| row.as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect::<Vec<_>>())
+            .flat_map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_f64().unwrap())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         let py_noise = py["noise_variance"].as_f64().unwrap();
 
@@ -789,10 +1029,16 @@ print(json.dumps(out))
             assert!((a - b).abs() < 1e-8, "singular value mismatch: {a} vs {b}");
         }
         for (a, b) in rust.explained_variance.iter().zip(py_ev.iter()) {
-            assert!((a - b).abs() < 1e-10, "explained variance mismatch: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-10,
+                "explained variance mismatch: {a} vs {b}"
+            );
         }
         for (a, b) in rust.explained_variance_ratio.iter().zip(py_evr.iter()) {
-            assert!((a - b).abs() < 1e-10, "explained variance ratio mismatch: {a} vs {b}");
+            assert!(
+                (a - b).abs() < 1e-10,
+                "explained variance ratio mismatch: {a} vs {b}"
+            );
         }
         assert!((rust.noise_variance - py_noise).abs() < 1e-10);
 
@@ -815,12 +1061,168 @@ print(json.dumps(out))
                 1.0
             };
             for (a, b) in rust_score_col.iter().zip(py_score_col.iter()) {
-                assert!((a - sign * b).abs() < 1e-8, "score mismatch: {a} vs {}", sign * b);
+                assert!(
+                    (a - sign * b).abs() < 1e-8,
+                    "score mismatch: {a} vs {}",
+                    sign * b
+                );
             }
             for (a, b) in rust_comp_row.iter().zip(py_comp_row.iter()) {
-                assert!((a - sign * b).abs() < 1e-8, "component mismatch: {a} vs {}", sign * b);
+                assert!(
+                    (a - sign * b).abs() < 1e-8,
+                    "component mismatch: {a} vs {}",
+                    sign * b
+                );
             }
         }
+    }
+
+    #[test]
+    fn rejects_invalid_csr_inputs() {
+        let data_indices_mismatch = CsrMatrix {
+            n_rows: 1,
+            n_cols: 2,
+            data: vec![1.0],
+            indices: vec![],
+            indptr: vec![0, 1],
+        };
+        assert!(matches!(
+            data_indices_mismatch.validate(),
+            Err(RuPcaError::InvalidInput(msg))
+                if msg.contains("data and indices length mismatch")
+        ));
+
+        let wrong_indptr_len = CsrMatrix {
+            n_rows: 2,
+            n_cols: 2,
+            data: vec![1.0],
+            indices: vec![0],
+            indptr: vec![0, 1],
+        };
+        assert!(matches!(
+            wrong_indptr_len.validate(),
+            Err(RuPcaError::InvalidInput(msg))
+                if msg.contains("indptr length must be n_rows + 1")
+        ));
+
+        let indptr_not_starting_at_zero = CsrMatrix {
+            n_rows: 1,
+            n_cols: 2,
+            data: vec![1.0],
+            indices: vec![0],
+            indptr: vec![1, 1],
+        };
+        assert!(matches!(
+            indptr_not_starting_at_zero.validate(),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("indptr must start at 0")
+        ));
+
+        let indptr_not_ending_at_nnz = CsrMatrix {
+            n_rows: 1,
+            n_cols: 2,
+            data: vec![1.0],
+            indices: vec![0],
+            indptr: vec![0, 0],
+        };
+        assert!(matches!(
+            indptr_not_ending_at_nnz.validate(),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("indptr must end at nnz")
+        ));
+
+        let nondecreasing_indptr = CsrMatrix {
+            n_rows: 2,
+            n_cols: 2,
+            data: vec![1.0],
+            indices: vec![0],
+            indptr: vec![0, 2, 1],
+        };
+        assert!(matches!(
+            nondecreasing_indptr.validate(),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("indptr must be nondecreasing")
+        ));
+
+        let out_of_bounds_column = CsrMatrix {
+            n_rows: 1,
+            n_cols: 2,
+            data: vec![1.0],
+            indices: vec![2],
+            indptr: vec![0, 1],
+        };
+        assert!(matches!(
+            out_of_bounds_column.validate(),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("column index out of bounds")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_shifted_clr_row_center_length() {
+        let x = ShiftedClrCsrMatrix {
+            sparse: test_csr(2, 3, &[(0, 0, 1.0), (1, 2, 2.0)]),
+            row_center: vec![0.5],
+        };
+        assert!(matches!(
+            x.validate(),
+            Err(RuPcaError::InvalidInput(msg))
+                if msg.contains("row_center length must equal sparse.n_rows")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_public_pca_inputs() {
+        let empty_rows = CsrMatrix {
+            n_rows: 0,
+            n_cols: 3,
+            data: vec![],
+            indices: vec![],
+            indptr: vec![0],
+        };
+        assert!(matches!(
+            pca_scanpy_sparse_csr(&empty_rows, ScanpyPcaParams::default()),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("empty matrix")
+        ));
+
+        let x = test_csr(
+            4,
+            3,
+            &[
+                (0, 0, 1.0),
+                (1, 1, 2.0),
+                (2, 2, 3.0),
+                (3, 0, 4.0),
+                (3, 2, 1.0),
+            ],
+        );
+        assert!(matches!(
+            pca_scanpy_sparse_csr(
+                &x,
+                ScanpyPcaParams {
+                    n_components: 0,
+                    ..ScanpyPcaParams::default()
+                }
+            ),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("n_components")
+        ));
+        assert!(matches!(
+            pca_scanpy_sparse_csr(
+                &x,
+                ScanpyPcaParams {
+                    n_components: 3,
+                    ..ScanpyPcaParams::default()
+                }
+            ),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("n_components")
+        ));
+        assert!(matches!(
+            pca_scanpy_sparse_csr(
+                &x,
+                ScanpyPcaParams {
+                    n_components: 2,
+                    ncv: Some(2),
+                    ..ScanpyPcaParams::default()
+                }
+            ),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("k < ncv <= n")
+        ));
     }
 
     #[test]
@@ -866,7 +1268,11 @@ print(json.dumps(out))
                 .map(|i| got.scores[i * k + j])
                 .collect::<Vec<_>>();
             let ref_col = scores_ref.column(j).iter().copied().collect::<Vec<_>>();
-            assert!(abs_dot(&got_col, &ref_col) / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt()) > 0.999999);
+            assert!(
+                abs_dot(&got_col, &ref_col)
+                    / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt())
+                    > 0.999999
+            );
         }
         for j in 0..k {
             let got_row = (0..x.n_cols)
@@ -919,11 +1325,236 @@ print(json.dumps(out))
                 .map(|i| got.scores[i * k + j])
                 .collect::<Vec<_>>();
             let ref_col = scores_ref.column(j).iter().copied().collect::<Vec<_>>();
-            assert!(abs_dot(&got_col, &ref_col) / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt()) > 0.999999);
+            assert!(
+                abs_dot(&got_col, &ref_col)
+                    / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt())
+                    > 0.999999
+            );
         }
         for j in 0..k {
             let got_row = (0..x.n_cols)
                 .map(|i| got.components[j * x.n_cols + i])
+                .collect::<Vec<_>>();
+            let ref_row = comps_ref.row(j).iter().copied().collect::<Vec<_>>();
+            assert!(abs_dot(&got_row, &ref_row) > 0.999999);
+        }
+    }
+
+    #[test]
+    fn shifted_clr_path_matches_dense_svd_on_tall_matrix() {
+        let sparse = test_csr(
+            7,
+            4,
+            &[
+                (0, 0, 1.4),
+                (0, 2, 0.6),
+                (1, 1, 1.8),
+                (1, 3, 0.9),
+                (2, 0, 0.7),
+                (2, 2, 1.5),
+                (2, 3, 0.3),
+                (3, 1, 1.2),
+                (3, 2, 0.4),
+                (4, 0, 1.9),
+                (4, 3, 1.1),
+                (5, 1, 0.8),
+                (5, 2, 1.7),
+                (6, 0, 0.5),
+                (6, 1, 1.3),
+            ],
+        );
+        let x = shifted_clr_from_sparse(sparse);
+        let k = 2;
+        let _guard = lock_solver();
+        let got = pca_shifted_clr_sparse_csr(
+            &x,
+            ScanpyPcaParams {
+                n_components: k,
+                tol: 0.0,
+                ncv: None,
+                maxiter: None,
+                seed: 1,
+            },
+        )
+        .unwrap();
+        let (s_ref, scores_ref, comps_ref) = shifted_clr_dense_reference(&x, k);
+
+        for (a, b) in got.singular_values.iter().zip(s_ref.iter()) {
+            assert!((a - b).abs() < 1e-8);
+        }
+        for j in 0..k {
+            let got_col = (0..x.sparse.n_rows)
+                .map(|i| got.scores[i * k + j])
+                .collect::<Vec<_>>();
+            let ref_col = scores_ref.column(j).iter().copied().collect::<Vec<_>>();
+            assert!(
+                abs_dot(&got_col, &ref_col)
+                    / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt())
+                    > 0.999999
+            );
+        }
+        for j in 0..k {
+            let got_row = (0..x.sparse.n_cols)
+                .map(|i| got.components[j * x.sparse.n_cols + i])
+                .collect::<Vec<_>>();
+            let ref_row = comps_ref.row(j).iter().copied().collect::<Vec<_>>();
+            assert!(abs_dot(&got_row, &ref_row) > 0.999999);
+        }
+    }
+
+    #[test]
+    fn shifted_clr_sparse_representation_matches_dense_materialization() {
+        let sparse = test_csr(
+            6,
+            5,
+            &[
+                (0, 0, 1.4),
+                (0, 2, 0.6),
+                (1, 1, 1.8),
+                (1, 3, 0.9),
+                (2, 0, 0.7),
+                (2, 2, 1.5),
+                (2, 4, 0.3),
+                (3, 1, 1.2),
+                (3, 2, 0.4),
+                (4, 0, 1.9),
+                (4, 3, 1.1),
+                (5, 1, 0.8),
+                (5, 2, 1.7),
+                (5, 4, 0.5),
+            ],
+        );
+        let x = shifted_clr_from_sparse(sparse);
+        let dense = shifted_clr_dense(&x);
+        let centered_dense = shifted_clr_centered_dense(&x);
+        let (mean, var) = x.mean_variance_axis0();
+
+        let mut dense_mean = vec![0.0; x.sparse.n_cols];
+        let mut dense_var = vec![0.0; x.sparse.n_cols];
+        for j in 0..x.sparse.n_cols {
+            for i in 0..x.sparse.n_rows {
+                dense_mean[j] += dense[(i, j)];
+                dense_var[j] += dense[(i, j)] * dense[(i, j)];
+            }
+            dense_mean[j] /= x.sparse.n_rows as f64;
+            dense_var[j] = dense_var[j] / x.sparse.n_rows as f64 - dense_mean[j] * dense_mean[j];
+        }
+        assert_all_close(&mean, &dense_mean, 1e-14);
+        assert_all_close(&var, &dense_var, 1e-14);
+
+        let right = [0.7, -1.1, 0.3, 2.0, -0.4];
+        let mut got_rows = vec![0.0; x.sparse.n_rows];
+        x.matvec(&right, &mut got_rows);
+        let mut dense_rows = vec![0.0; x.sparse.n_rows];
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense_rows[i] += dense[(i, j)] * right[j];
+            }
+        }
+        assert_all_close(&got_rows, &dense_rows, 1e-14);
+
+        let left = [1.3, -0.2, 0.8, -1.7, 0.4, 0.6];
+        let mut got_cols = vec![0.0; x.sparse.n_cols];
+        x.rmatvec(&left, &mut got_cols);
+        let mut dense_cols = vec![0.0; x.sparse.n_cols];
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense_cols[j] += dense[(i, j)] * left[i];
+            }
+        }
+        assert_all_close(&got_cols, &dense_cols, 1e-14);
+
+        let centered = ImplicitColumnOffset { x: &x, mean: &mean };
+        centered.matvec(&right, &mut got_rows);
+        dense_rows.fill(0.0);
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense_rows[i] += centered_dense[(i, j)] * right[j];
+            }
+        }
+        assert_all_close(&got_rows, &dense_rows, 1e-14);
+
+        centered.rmatvec(&left, &mut got_cols);
+        dense_cols.fill(0.0);
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense_cols[j] += centered_dense[(i, j)] * left[i];
+            }
+        }
+        assert_all_close(&got_cols, &dense_cols, 1e-14);
+
+        let mut tmp = vec![0.0; x.sparse.n_rows];
+        let mut got_normal = vec![0.0; x.sparse.n_cols];
+        centered.matvec(&right, &mut tmp);
+        centered.rmatvec(&tmp, &mut got_normal);
+        let mut dense_tmp = vec![0.0; x.sparse.n_rows];
+        let mut dense_normal = vec![0.0; x.sparse.n_cols];
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense_tmp[i] += centered_dense[(i, j)] * right[j];
+            }
+        }
+        for i in 0..x.sparse.n_rows {
+            for j in 0..x.sparse.n_cols {
+                dense_normal[j] += centered_dense[(i, j)] * dense_tmp[i];
+            }
+        }
+        assert_all_close(&got_normal, &dense_normal, 1e-13);
+    }
+
+    #[test]
+    fn shifted_clr_path_matches_dense_svd_on_wide_matrix() {
+        let sparse = test_csr(
+            4,
+            7,
+            &[
+                (0, 0, 1.6),
+                (0, 3, 0.8),
+                (0, 6, 1.1),
+                (1, 1, 1.5),
+                (1, 4, 0.7),
+                (1, 5, 1.4),
+                (2, 0, 0.9),
+                (2, 2, 1.8),
+                (2, 6, 0.6),
+                (3, 1, 0.5),
+                (3, 3, 1.2),
+                (3, 4, 1.9),
+            ],
+        );
+        let x = shifted_clr_from_sparse(sparse);
+        let k = 2;
+        let _guard = lock_solver();
+        let got = pca_shifted_clr_sparse_csr(
+            &x,
+            ScanpyPcaParams {
+                n_components: k,
+                tol: 0.0,
+                ncv: None,
+                maxiter: None,
+                seed: 1,
+            },
+        )
+        .unwrap();
+        let (s_ref, scores_ref, comps_ref) = shifted_clr_dense_reference(&x, k);
+
+        for (a, b) in got.singular_values.iter().zip(s_ref.iter()) {
+            assert!((a - b).abs() < 1e-8);
+        }
+        for j in 0..k {
+            let got_col = (0..x.sparse.n_rows)
+                .map(|i| got.scores[i * k + j])
+                .collect::<Vec<_>>();
+            let ref_col = scores_ref.column(j).iter().copied().collect::<Vec<_>>();
+            assert!(
+                abs_dot(&got_col, &ref_col)
+                    / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt())
+                    > 0.999999
+            );
+        }
+        for j in 0..k {
+            let got_row = (0..x.sparse.n_cols)
+                .map(|i| got.components[j * x.sparse.n_cols + i])
                 .collect::<Vec<_>>();
             let ref_row = comps_ref.row(j).iter().copied().collect::<Vec<_>>();
             assert!(abs_dot(&got_row, &ref_row) > 0.999999);
@@ -1012,9 +1643,18 @@ print(json.dumps(out))
         let mut a = DMatrix::from_row_slice(2, 3, &[1.0, 2.0, 3.0, 10.0, 20.0, 30.0]);
         dsesrt("LA", true, &mut x, &mut a);
         assert_eq!(x, vec![-1.0, 2.0, 3.0]);
-        assert_eq!(a.column(0).iter().copied().collect::<Vec<_>>(), vec![2.0, 20.0]);
-        assert_eq!(a.column(1).iter().copied().collect::<Vec<_>>(), vec![3.0, 30.0]);
-        assert_eq!(a.column(2).iter().copied().collect::<Vec<_>>(), vec![1.0, 10.0]);
+        assert_eq!(
+            a.column(0).iter().copied().collect::<Vec<_>>(),
+            vec![2.0, 20.0]
+        );
+        assert_eq!(
+            a.column(1).iter().copied().collect::<Vec<_>>(),
+            vec![3.0, 30.0]
+        );
+        assert_eq!(
+            a.column(2).iter().copied().collect::<Vec<_>>(),
+            vec![1.0, 10.0]
+        );
     }
 
     #[test]
@@ -1053,16 +1693,7 @@ print(json.dumps(out))
         let kev = 2;
         let np = 2;
         let mut v = DMatrix::from_fn(n, kev + np, |r, c| ((r + 1 + 3 * c) as f64) / 10.0);
-        let mut h = DMatrix::from_row_slice(
-            kev + np,
-            2,
-            &[
-                0.0, 4.0,
-                0.5, 3.0,
-                0.2, 2.0,
-                0.1, 1.0,
-            ],
-        );
+        let mut h = DMatrix::from_row_slice(kev + np, 2, &[0.0, 4.0, 0.5, 3.0, 0.2, 2.0, 0.1, 1.0]);
         let mut resid = vec![0.2, -0.1, 0.05, 0.3, -0.2];
         let shift = vec![0.3, 0.7];
         dsapps(kev, np, &shift, &mut v, &mut h, &mut resid);
@@ -1084,31 +1715,19 @@ print(json.dumps(out))
             n,
             n,
             &[
-                4.0, 1.0, 0.0, 0.0, 0.0,
-                1.0, 3.0, 1.0, 0.0, 0.0,
-                0.0, 1.0, 2.0, 1.0, 0.0,
-                0.0, 0.0, 1.0, 5.0, 1.0,
-                0.0, 0.0, 0.0, 1.0, 6.0,
+                4.0, 1.0, 0.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0,
+                0.0, 1.0, 5.0, 1.0, 0.0, 0.0, 0.0, 1.0, 6.0,
             ],
         );
-        let out = dsaitr_mode1(
-            n,
-            k,
-            np,
-            &mut resid,
-            &mut rnorm,
-            &mut v,
-            &mut h,
-            |x, y| {
-                for i in 0..n {
-                    let mut acc = 0.0;
-                    for j in 0..n {
-                        acc += a[(i, j)] * x[j];
-                    }
-                    y[i] = acc;
+        let out = dsaitr_mode1(n, k, np, &mut resid, &mut rnorm, &mut v, &mut h, |x, y| {
+            for i in 0..n {
+                let mut acc = 0.0;
+                for j in 0..n {
+                    acc += a[(i, j)] * x[j];
                 }
-            },
-        )
+                y[i] = acc;
+            }
+        })
         .unwrap();
         assert_eq!(out.info, 0);
         for i in 0..np {
@@ -1117,7 +1736,11 @@ print(json.dumps(out))
             assert!((ni - 1.0).abs() < 1e-10);
             for j in 0..i {
                 let col_j = v.column(j);
-                let dot_ij = col_i.iter().zip(col_j.iter()).map(|(a, b)| a * b).sum::<f64>();
+                let dot_ij = col_i
+                    .iter()
+                    .zip(col_j.iter())
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
                 assert!(dot_ij.abs() < 1e-8);
             }
         }
@@ -1150,12 +1773,9 @@ print(json.dumps(out))
             n,
             n,
             &[
-                6.0, 1.0, 0.0, 0.0, 0.0, 0.0,
-                1.0, 5.0, 1.0, 0.0, 0.0, 0.0,
-                0.0, 1.0, 4.0, 1.0, 0.0, 0.0,
-                0.0, 0.0, 1.0, 3.0, 1.0, 0.0,
-                0.0, 0.0, 0.0, 1.0, 2.0, 1.0,
-                0.0, 0.0, 0.0, 0.0, 1.0, 1.0,
+                6.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 5.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 4.0, 1.0,
+                0.0, 0.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0,
+                0.0, 0.0, 1.0, 1.0,
             ],
         );
         let out = dsaup2_mode1(
