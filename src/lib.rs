@@ -94,6 +94,29 @@ impl CsrMatrix {
     }
 }
 
+/// Dense row-major matrix input for direct centered dense SVD.
+///
+/// This is intended for ordinary dense matrices. PFlogPF / shifted-CLR input
+/// should use `ShiftedClrCsrMatrix` so the shifted dense values are not
+/// materialized.
+#[derive(Debug, Clone)]
+pub struct DenseMatrix {
+    pub n_rows: usize,
+    pub n_cols: usize,
+    pub data: Vec<f64>,
+}
+
+impl DenseMatrix {
+    pub fn validate(&self) -> Result<()> {
+        if self.data.len() != self.n_rows * self.n_cols {
+            return Err(RuPcaError::InvalidInput(
+                "dense data length must equal n_rows * n_cols".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 trait PcaInputMatrix {
     fn validate(&self) -> Result<()>;
     fn n_rows(&self) -> usize;
@@ -288,10 +311,15 @@ pub struct ScanpyPcaResult {
     pub n_samples: usize,
     pub n_features: usize,
     pub n_components: usize,
+    pub warnings: Vec<String>,
 }
 
 pub fn pca_scanpy_sparse_csr(x: &CsrMatrix, params: ScanpyPcaParams) -> Result<ScanpyPcaResult> {
     pca_column_centered(x, params)
+}
+
+pub fn pca_scanpy_dense(x: &DenseMatrix, params: ScanpyPcaParams) -> Result<ScanpyPcaResult> {
+    pca_dense_centered_svd(x, params)
 }
 
 pub fn pca_shifted_clr_sparse_csr(
@@ -438,6 +466,101 @@ fn pca_column_centered<M: PcaInputMatrix>(
         n_samples,
         n_features,
         n_components: n_keep,
+        warnings: Vec::new(),
+    })
+}
+
+fn pca_dense_centered_svd(x: &DenseMatrix, params: ScanpyPcaParams) -> Result<ScanpyPcaResult> {
+    x.validate()?;
+    let n_samples = x.n_rows;
+    let n_features = x.n_cols;
+    if n_samples == 0 || n_features == 0 {
+        return Err(RuPcaError::InvalidInput("empty matrix".to_string()));
+    }
+    let k = params.n_components;
+    let min_dim = n_samples.min(n_features);
+    if !(1..=min_dim).contains(&k) {
+        return Err(RuPcaError::InvalidInput(format!(
+            "n_components must be in [1, {}], got {}",
+            min_dim, k
+        )));
+    }
+
+    let mut centered = DMatrix::from_row_slice(n_samples, n_features, &x.data);
+    let mut mean = vec![0.0; n_features];
+    let mut var = vec![0.0; n_features];
+    for j in 0..n_features {
+        for i in 0..n_samples {
+            mean[j] += centered[(i, j)];
+            var[j] += centered[(i, j)] * centered[(i, j)];
+        }
+        mean[j] /= n_samples as f64;
+        var[j] = var[j] / n_samples as f64 - mean[j] * mean[j];
+        for i in 0..n_samples {
+            centered[(i, j)] -= mean[j];
+        }
+    }
+    let total_var = if n_samples > 1 {
+        var.iter().sum::<f64>() * n_samples as f64 / (n_samples as f64 - 1.0)
+    } else {
+        0.0
+    };
+
+    let svd = centered.svd(true, true);
+    let mut u = svd.u.ok_or(RuPcaError::MissingSvdFactors)?;
+    let s = svd.singular_values.as_slice().to_vec();
+    let mut vt = svd.v_t.ok_or(RuPcaError::MissingSvdFactors)?;
+    svd_flip_u_based_false(&mut u, &mut vt);
+
+    let n_keep = k.min(s.len());
+    let mut scores = vec![0.0; n_samples * n_keep];
+    for i in 0..n_samples {
+        for j in 0..n_keep {
+            scores[i * n_keep + j] = u[(i, j)] * s[j];
+        }
+    }
+
+    let mut components = vec![0.0; n_keep * n_features];
+    for i in 0..n_keep {
+        for j in 0..n_features {
+            components[i * n_features + j] = vt[(i, j)];
+        }
+    }
+
+    let explained_variance = s
+        .iter()
+        .take(n_keep)
+        .map(|v| (v * v) / (n_samples as f64 - 1.0))
+        .collect::<Vec<_>>();
+    let explained_variance_ratio = if total_var > 0.0 {
+        explained_variance
+            .iter()
+            .map(|v| *v / total_var)
+            .collect::<Vec<_>>()
+    } else {
+        vec![0.0; n_keep]
+    };
+    let noise_variance = if n_keep < min_dim {
+        let residual = total_var - explained_variance.iter().sum::<f64>();
+        residual / (min_dim - n_keep) as f64
+    } else {
+        0.0
+    };
+
+    Ok(ScanpyPcaResult {
+        scores,
+        components,
+        mean,
+        explained_variance,
+        explained_variance_ratio,
+        singular_values: s.into_iter().take(n_keep).collect(),
+        noise_variance,
+        n_samples,
+        n_features,
+        n_components: n_keep,
+        warnings: vec![
+            "input matrix is dense; using direct centered dense SVD. PFlogPF / shifted-CLR input should be supplied as ShiftedClrCsrMatrix rather than a dense matrix".to_string(),
+        ],
     })
 }
 
@@ -810,6 +933,20 @@ mod tests {
         (s, scores, vt.rows(0, n_components).into_owned())
     }
 
+    fn dense_matrix_from_csr(x: &CsrMatrix) -> DenseMatrix {
+        let mut data = vec![0.0; x.n_rows * x.n_cols];
+        for i in 0..x.n_rows {
+            for p in x.indptr[i]..x.indptr[i + 1] {
+                data[i * x.n_cols + x.indices[p]] = x.data[p];
+            }
+        }
+        DenseMatrix {
+            n_rows: x.n_rows,
+            n_cols: x.n_cols,
+            data,
+        }
+    }
+
     fn shifted_clr_from_sparse(sparse: CsrMatrix) -> ShiftedClrCsrMatrix {
         let mut row_center = vec![0.0; sparse.n_rows];
         for i in 0..sparse.n_rows {
@@ -1168,6 +1305,56 @@ print(json.dumps(out))
     }
 
     #[test]
+    fn rejects_invalid_dense_inputs() {
+        let bad_shape = DenseMatrix {
+            n_rows: 2,
+            n_cols: 3,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        assert!(matches!(
+            bad_shape.validate(),
+            Err(RuPcaError::InvalidInput(msg))
+                if msg.contains("dense data length must equal n_rows * n_cols")
+        ));
+
+        let empty = DenseMatrix {
+            n_rows: 0,
+            n_cols: 3,
+            data: vec![],
+        };
+        assert!(matches!(
+            pca_scanpy_dense(&empty, ScanpyPcaParams::default()),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("empty matrix")
+        ));
+
+        let x = DenseMatrix {
+            n_rows: 3,
+            n_cols: 2,
+            data: vec![1.0, 0.0, 0.0, 2.0, 3.0, 1.0],
+        };
+        assert!(matches!(
+            pca_scanpy_dense(
+                &x,
+                ScanpyPcaParams {
+                    n_components: 0,
+                    ..ScanpyPcaParams::default()
+                }
+            ),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("n_components")
+        ));
+        assert!(matches!(
+            pca_scanpy_dense(
+                &x,
+                ScanpyPcaParams {
+                    n_components: 3,
+                    ..ScanpyPcaParams::default()
+                }
+            ),
+            Err(RuPcaError::InvalidInput(msg)) if msg.contains("n_components")
+        ));
+    }
+
+    #[test]
     fn rejects_invalid_public_pca_inputs() {
         let empty_rows = CsrMatrix {
             n_rows: 0,
@@ -1319,6 +1506,121 @@ print(json.dumps(out))
 
         for (a, b) in got.singular_values.iter().zip(s_ref.iter()) {
             assert!((a - b).abs() < 1e-8);
+        }
+        for j in 0..k {
+            let got_col = (0..x.n_rows)
+                .map(|i| got.scores[i * k + j])
+                .collect::<Vec<_>>();
+            let ref_col = scores_ref.column(j).iter().copied().collect::<Vec<_>>();
+            assert!(
+                abs_dot(&got_col, &ref_col)
+                    / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt())
+                    > 0.999999
+            );
+        }
+        for j in 0..k {
+            let got_row = (0..x.n_cols)
+                .map(|i| got.components[j * x.n_cols + i])
+                .collect::<Vec<_>>();
+            let ref_row = comps_ref.row(j).iter().copied().collect::<Vec<_>>();
+            assert!(abs_dot(&got_row, &ref_row) > 0.999999);
+        }
+    }
+
+    #[test]
+    fn dense_path_matches_dense_svd_on_tall_matrix_and_warns() {
+        let sparse = test_csr(
+            6,
+            4,
+            &[
+                (0, 0, 2.0),
+                (0, 2, 1.0),
+                (1, 1, 3.0),
+                (1, 2, 1.0),
+                (2, 0, 1.0),
+                (2, 3, 4.0),
+                (3, 1, 2.0),
+                (3, 3, 1.0),
+                (4, 0, 3.0),
+                (4, 2, 2.0),
+                (5, 1, 1.0),
+                (5, 3, 2.0),
+            ],
+        );
+        let x = dense_matrix_from_csr(&sparse);
+        let k = 2;
+        let got = pca_scanpy_dense(
+            &x,
+            ScanpyPcaParams {
+                n_components: k,
+                tol: 0.0,
+                ncv: Some(100),
+                maxiter: Some(10),
+                seed: 99,
+            },
+        )
+        .unwrap();
+        let (s_ref, scores_ref, comps_ref) = dense_reference(&sparse, k);
+
+        assert_eq!(got.warnings.len(), 1);
+        assert!(got.warnings[0].contains("input matrix is dense"));
+        assert!(got.warnings[0].contains("ShiftedClrCsrMatrix"));
+        for (a, b) in got.singular_values.iter().zip(s_ref.iter()) {
+            assert!((a - b).abs() < 1e-10);
+        }
+        for j in 0..k {
+            let got_col = (0..x.n_rows)
+                .map(|i| got.scores[i * k + j])
+                .collect::<Vec<_>>();
+            let ref_col = scores_ref.column(j).iter().copied().collect::<Vec<_>>();
+            assert!(
+                abs_dot(&got_col, &ref_col)
+                    / (dot(&got_col, &got_col).sqrt() * dot(&ref_col, &ref_col).sqrt())
+                    > 0.999999
+            );
+        }
+        for j in 0..k {
+            let got_row = (0..x.n_cols)
+                .map(|i| got.components[j * x.n_cols + i])
+                .collect::<Vec<_>>();
+            let ref_row = comps_ref.row(j).iter().copied().collect::<Vec<_>>();
+            assert!(abs_dot(&got_row, &ref_row) > 0.999999);
+        }
+    }
+
+    #[test]
+    fn dense_path_matches_dense_svd_on_wide_matrix() {
+        let sparse = test_csr(
+            4,
+            6,
+            &[
+                (0, 0, 2.0),
+                (0, 3, 1.0),
+                (0, 5, 3.0),
+                (1, 1, 4.0),
+                (1, 4, 1.0),
+                (2, 0, 1.0),
+                (2, 2, 2.0),
+                (2, 5, 1.0),
+                (3, 1, 3.0),
+                (3, 3, 2.0),
+                (3, 4, 2.0),
+            ],
+        );
+        let x = dense_matrix_from_csr(&sparse);
+        let k = 2;
+        let got = pca_scanpy_dense(
+            &x,
+            ScanpyPcaParams {
+                n_components: k,
+                ..ScanpyPcaParams::default()
+            },
+        )
+        .unwrap();
+        let (s_ref, scores_ref, comps_ref) = dense_reference(&sparse, k);
+
+        for (a, b) in got.singular_values.iter().zip(s_ref.iter()) {
+            assert!((a - b).abs() < 1e-10);
         }
         for j in 0..k {
             let got_col = (0..x.n_rows)

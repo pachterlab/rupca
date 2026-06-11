@@ -1,9 +1,9 @@
 # rupca (rust PCA)
 
 `rupca` is a small Rust crate that mirrors the sparse centered PCA path used by Scanpy for sparse input with `zero_center=True`.
-It is compatible with both ordinary sparse inputs, such as logPF-normalized matrices, and PFlogPF / shifted-CLR inputs represented without densifying the matrix; see [*Depth normalization for single-cell genomics count data*](https://www.biorxiv.org/content/10.1101/2022.05.06.490859v3) by A. Sina Booeshaghi, Ingileif B. Hallgrímsdóttir, Ángel Gálvez-Merchán, and Lior Pachter (doi: `10.1101/2022.05.06.490859v3`).
+It is compatible with ordinary sparse inputs, ordinary dense inputs, and PFlogPF / shifted-CLR inputs represented without densifying the matrix; see [*Depth normalization for single-cell genomics count data*](https://www.biorxiv.org/content/10.1101/2022.05.06.490859v3) by A. Sina Booeshaghi, Ingileif B. Hallgrímsdóttir, Ángel Gálvez-Merchán, and Lior Pachter (doi: `10.1101/2022.05.06.490859v3`).
 
-The implemented path is:
+The sparse and shifted-CLR PCA path is:
 
 1. Compute per-feature means and variances.
 2. Represent centering implicitly as `X - 1 * mean^T`.
@@ -18,12 +18,17 @@ The implemented path is:
 The current public entrypoints are:
 
 - `pca_scanpy_sparse_csr(&CsrMatrix, ScanpyPcaParams) -> Result<ScanpyPcaResult>`
+- `pca_scanpy_dense(&DenseMatrix, ScanpyPcaParams) -> Result<ScanpyPcaResult>`
 - `pca_shifted_clr_sparse_csr(&ShiftedClrCsrMatrix, ScanpyPcaParams) -> Result<ScanpyPcaResult>`
 
 The plain sparse matrix format is a simple CSR container owned by `rupca`.
+The dense matrix format is row-major and uses direct centered dense SVD; dense
+results include a warning in `ScanpyPcaResult::warnings`.
 `ShiftedClrCsrMatrix` represents the dense matrix `sparse[i, j] - row_center[i]`.
 This keeps PFlogPF / shifted-CLR data as a sparse shifted-log matrix plus a row
 centering vector while preserving implicit column centering inside PCA.
+PFlogPF / shifted-CLR input should be supplied as `ShiftedClrCsrMatrix`, not as a
+dense matrix.
 
 ## Status
 
@@ -31,6 +36,7 @@ The crate currently:
 
 - compiles cleanly
 - passes unit tests on both tall and wide sparse matrices against the corresponding centered dense SVD reference
+- passes unit tests on both tall and wide dense matrices against the corresponding centered dense SVD reference
 - passes unit tests on both tall and wide shifted-CLR-style matrices against a centered dense SVD reference
 - passes representation-level tests showing sparse PFlogPF / shifted-CLR operations match dense materialization to floating-point precision
 - vendors the exact ARPACK symmetric reference sources used for the Scanpy/sklearn sparse path in [vendor/arpack-ng/SRC](/Users/lpachter/Dropbox/claude/projects/rupca/vendor/arpack-ng/SRC)
