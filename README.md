@@ -39,4 +39,5 @@ The crate currently:
 
 - This is intended to match the Scanpy sparse PCA algorithmic path, not the full Scanpy Python object model.
 - The eigensolver is now Rust-native rather than calling external ARPACK.
+- In PBMC 10k benchmarks with 50 PCs, Rust sparse logPF PCA was about 1.35x faster than Scanpy sparse logPF PCA; Rust PFlogPF / shifted-CLR PCA with `ncv=250` was about 1.41x faster than Scanpy sparse logPF PCA.
 - The imported ARPACK reference sources and porting map are documented in [docs/arpack/PORTING.md](/Users/lpachter/Dropbox/claude/projects/rupca/docs/arpack/PORTING.md).
