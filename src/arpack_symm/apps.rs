@@ -77,7 +77,14 @@ pub fn dsapps(
                 h[(istart + 1, 1)] = c * a4 - s * a3;
                 h[(istart + 1, 0)] = c * a3 + s * a4;
 
-                for j in 0..=istart.min(kplusp - 1) {
+                // Accumulate Q <- Q * G(istart, istart+1). The Fortran dsapps.f:308 bounds this by
+                // `min(istart+jj, kplusp)` rows (jj = the implicit-shift index), an optimization
+                // exploiting that lower rows are still zero at shift jj. The original port dropped
+                // the `jj` term, leaving nonzero Q entries un-rotated and corrupting the restarted
+                // Lanczos basis (producing Ritz values outside the operator's spectrum and false
+                // convergence). A Givens right-multiply touches all rows of the two columns, so
+                // applying it to every row is exact (rotating structural zeros is a no-op).
+                for j in 0..kplusp {
                     let a1: f64 = c * q[(j, istart)] + s * q[(j, istart + 1)];
                     q[(j, istart + 1)] = -s * q[(j, istart)] + c * q[(j, istart + 1)];
                     q[(j, istart)] = a1;
@@ -105,8 +112,9 @@ pub fn dsapps(
                     h[(i + 1, 1)] = c * a4 - s * a3;
                     h[(i + 1, 0)] = c * a3 + s * a4;
 
-                    let upper = (i + 1).min(kplusp - 1);
-                    for j in 0..=upper {
+                    // Same fix as the first rotation: accumulate over all rows (Fortran dsapps.f:375
+                    // bounds this by `min(i+jj, kplusp)`; the dropped `jj` corrupted Q).
+                    for j in 0..kplusp {
                         let a1: f64 = c * q[(j, i)] + s * q[(j, i + 1)];
                         q[(j, i + 1)] = -s * q[(j, i)] + c * q[(j, i + 1)];
                         q[(j, i)] = a1;

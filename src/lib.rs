@@ -731,6 +731,14 @@ where
             result.basis_dim, k
         )));
     }
+    // Robustness: if the eigensolver converged no Ritz values, the extracted basis would be empty
+    // and the downstream dense SVD would panic. Return a clean error instead.
+    if result.nconv == 0 {
+        return Err(RuPcaError::Solver(format!(
+            "eigensolver converged 0 of {k} requested eigenpairs (did not converge); \
+             try a larger ncv, fewer components, or check the input"
+        )));
+    }
     let basis_dim = result.basis_dim.min(ncv);
     extract_selected_ritz_vectors(&v, &h, basis_dim, &result.ritz[..result.nconv], k)
 }
@@ -2119,5 +2127,62 @@ print(json.dumps(out))
         } else {
             assert!(out.np > 0);
         }
+    }
+
+    /// Regression test for the `dsapps` implicit-restart Q-accumulation bug.
+    ///
+    /// On a matrix large enough to require several implicit restarts (`ncv < min_dim`), the sparse
+    /// ARPACK path previously corrupted the tridiagonal `H`, returning Ritz values *outside* the
+    /// operator spectrum (so a dominant principal component was missed) or converging zero
+    /// eigenpairs and panicking. The small fixtures in the other tests converge in a single sweep,
+    /// so they did not exercise the restart path. The exact dense path is the oracle here.
+    #[test]
+    fn sparse_pca_matches_dense_on_structured_medium_matrix() {
+        let (n_rows, n_cols, n_groups) = (120usize, 30usize, 3usize);
+        let n_per = n_rows / n_groups;
+        let block = n_cols / (n_groups + 1);
+        // Deterministic LCG: structured clusters give well-separated top eigenvalues.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 40) as f64 / (1u64 << 24) as f64
+        };
+        let mut data = Vec::new();
+        let mut indices = Vec::new();
+        let mut indptr = vec![0usize];
+        for i in 0..n_rows {
+            let g = i / n_per;
+            for j in 0..n_cols {
+                let mut v = if next() < 0.5 { 0.0 } else { (next() * 5.0).floor() };
+                if j >= g * block && j < (g + 1) * block {
+                    v += 25.0;
+                }
+                if j == 0 {
+                    v += 1.0;
+                }
+                if v != 0.0 {
+                    data.push(v);
+                    indices.push(j);
+                }
+            }
+            indptr.push(data.len());
+        }
+        let sparse = CsrMatrix { n_rows, n_cols, data, indices, indptr };
+        let dense = dense_matrix_from_csr(&sparse);
+        let params = ScanpyPcaParams { n_components: 5, ..Default::default() };
+
+        let r_sparse = pca_scanpy_sparse_csr(&sparse, params).expect("sparse pca");
+        let r_dense = pca_scanpy_dense(&dense, params).expect("dense pca");
+
+        for (s, d) in r_sparse.explained_variance.iter().zip(r_dense.explained_variance.iter()) {
+            let rel = (s - d).abs() / d.abs().max(1e-12);
+            assert!(rel < 1e-6, "sparse EV {s} vs dense EV {d} (rel err {rel})");
+        }
+        // A correct Lanczos cannot report a Ritz value above the operator's largest eigenvalue.
+        let max_dense = r_dense.explained_variance[0];
+        assert!(
+            r_sparse.explained_variance.iter().all(|&v| v <= max_dense * (1.0 + 1e-6)),
+            "sparse PCA produced an explained variance above the dense maximum"
+        );
     }
 }
